@@ -19,7 +19,8 @@ Usage:
     python patch.py --path-cli "C:\\...\\agy.exe" patch cli
 """
 from __future__ import annotations
-import argparse, glob, hashlib, json, os, shutil, struct, sys
+import argparse, contextlib, functools, glob, hashlib, json, mmap, os, shutil, struct, sys
+from concurrent.futures import ThreadPoolExecutor
 try:
     import winreg
 except Exception:
@@ -63,11 +64,24 @@ def rmtree_quiet(p):
     except OSError:
         pass
 
+@contextlib.contextmanager
+def mapped(path):
+    """Read-only, zero-copy view of a file for marker/regex scans — avoids
+    slurping multi-MB binaries (agy.exe, app.asar, main.js) into RAM. The view
+    is bytes-like: it works with .find(), slicing, struct.unpack_from and re."""
+    with open(path, "rb") as f:
+        if os.fstat(f.fileno()).st_size == 0:
+            yield b""; return
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try: yield mm
+        finally: mm.close()
+
 # ----------------------------------------------------------------- discovery --
 # Generic, install-location-agnostic search: standard env roots + per-user/
 # machine "Programs"/Program Files + Windows registry InstallLocation + PATH
 # (+ scoop if present). Apps are matched by a STRUCTURAL marker file, never by
 # a hard-coded path or version.
+@functools.lru_cache(maxsize=1)
 def _reg_install_dirs():
     dirs = []
     if not winreg: return dirs
@@ -88,6 +102,7 @@ def _reg_install_dirs():
                 pass
     return dirs
 
+@functools.lru_cache(maxsize=1)
 def _roots():
     out = []
     for v in ("LOCALAPPDATA", "ProgramW6432", "PROGRAMFILES", "PROGRAMFILES(X86)", "ProgramData", "APPDATA"):
@@ -174,14 +189,19 @@ def cli_find_call(data):
     mva = pe.off2va(first)
     _n, traw, trsz, tva, _vs = pe.text()
     tb = data[traw:traw+trsz]; tva0 = pe.base+tva
-    lea = None; i = 0
-    while i < len(tb)-7:
-        if tb[i] in (0x48, 0x4C) and tb[i+1] == 0x8D and (tb[i+2] & 0xC7) == 0x05:
-            disp = struct.unpack_from("<i", tb, i+3)[0]
-            if tva0+i+7+disp == mva:
-                if lea is not None: raise LookupError("multiple LEA refs")
-                lea = traw+i; i += 7; continue
-        i += 1
+    # Find the RIP-relative LEA (48/4C 8D /r, mod=00 rm=101) referencing the
+    # marker. Scan the two opcode prefixes at C speed via bytes.find — only real
+    # candidates reach Python — instead of a per-byte loop over multi-MB .text.
+    lea = None
+    for prefix in (b"\x48\x8d", b"\x4c\x8d"):
+        p = tb.find(prefix)
+        while p != -1:
+            if p+7 <= len(tb) and (tb[p+2] & 0xC7) == 0x05:
+                disp = struct.unpack_from("<i", tb, p+3)[0]
+                if tva0+p+7+disp == mva:
+                    if lea is not None: raise LookupError("multiple LEA refs")
+                    lea = traw+p
+            p = tb.find(prefix, p+1)
     if lea is None: raise LookupError("no LEA ref to marker")
     for j in range(lea+7, lea+7+0x100):
         if data[j:j+5] == NOP5: return ("patched", j)
@@ -191,8 +211,8 @@ def cli_find_call(data):
     raise LookupError("no call after render site")
 
 def cli_status(path):
-    data = open(path, "rb").read()
-    kind, off = cli_find_call(data)
+    with mapped(path) as data:
+        kind, off = cli_find_call(data)
     return ("patched" if kind == "patched" else "unpatched", off)
 
 def cli_patch(path):
@@ -280,8 +300,8 @@ def manager_default_asars():
     return find_marker(os.path.join("resources", "app.asar"))
 
 def manager_status(path):
-    raw = open(path, "rb").read()
-    return ("patched" if b"__agyAuth" in raw else "unpatched", None)
+    with mapped(path) as raw:
+        return ("patched" if raw.find(b"__agyAuth") != -1 else "unpatched", None)
 
 def manager_patch(path):
     if is_locked(path): warn("app.asar is locked — close Antigravity (Manager) first"); return False
@@ -308,9 +328,10 @@ def ide_default_mains():
     return find_marker(os.path.join("resources", "app", "out", "main.js"))
 
 def ide_status(path):
-    d = open(path, "rb").read()
-    if IDE_DONE in d and not IDE_RE.search(d): return ("patched", None)
-    return ("unpatched" if IDE_RE.search(d) else "unknown", None)
+    with mapped(path) as d:
+        gate = IDE_RE.search(d)
+        if d.find(IDE_DONE) != -1 and not gate: return ("patched", None)
+        return ("unpatched" if gate else "unknown", None)
 
 def _ide_cache_dirs():
     dirs = []
@@ -369,21 +390,41 @@ def run(action, targets, overrides):
             warn(f"error: {e}"); rc = 1
     return rc
 
+def _status_of(t, path):
+    """Status string for an already-resolved path (no filesystem/registry scan)."""
+    if not path: return "not found"
+    try:
+        return SPEC[t]["status"](path)[0]
+    except Exception:
+        return "error"
+
 def state(t, overrides=None):
     """(path|None, status_str) for one target."""
     path = resolve(t, (overrides or {}).get(t))
-    if not path: return None, "not found"
-    try:
-        return path, SPEC[t]["status"](path)[0]
-    except Exception:
-        return path, "error"
+    return path, _status_of(t, path)
+
+def scan(overrides):
+    """Resolve paths + compute status for every target, once and concurrently.
+    Returns (paths, status) dicts keyed by target. Discovery (glob + registry)
+    and binary scans happen here instead of per menu redraw; the registry/root
+    probe is shared across targets and the three targets run in parallel."""
+    _reg_install_dirs.cache_clear(); _roots.cache_clear()   # rediscover on (re)scan
+    _roots()                                                # warm shared cache once
+    def one(t):
+        p = resolve(t, overrides.get(t))
+        return t, p, _status_of(t, p)
+    paths, status = {}, {}
+    with ThreadPoolExecutor(max_workers=len(TARGETS)) as ex:
+        for t, p, st in ex.map(one, TARGETS):
+            paths[t], status[t] = p, st
+    return paths, status
 
 # --------------------------------------------------------------- interactive --
 _STYLE = {"patched": "bold green", "unpatched": "yellow", "unknown": "magenta",
           "not found": "dim", "error": "bold red"}
 _ICON  = {"patched": "✓", "unpatched": "●", "unknown": "?", "not found": "·", "error": "!"}
 
-def _render(console, overrides):
+def _render(console, paths, status):
     from rich.table import Table
     from rich.panel import Panel
     tbl = Table(box=None, expand=True, pad_edge=False)
@@ -391,7 +432,7 @@ def _render(console, overrides):
     tbl.add_column("Status", no_wrap=True)
     tbl.add_column("Location", style="dim", overflow="fold")
     for t in TARGETS:
-        path, st = state(t, overrides)
+        path, st = paths[t], status[t]
         tbl.add_row(SPEC[t]["name"], f"[{_STYLE[st]}]{_ICON[st]} {st}[/]", path or "—")
     console.print(Panel(tbl, title="[bold white]agy-unlock[/] · Antigravity eligibility patcher",
                         subtitle="[dim]↑↓ move · enter select · space toggle[/]", border_style="cyan"))
@@ -403,9 +444,10 @@ def interactive(overrides):
     qs = questionary.Style([("qmark", "fg:#00afff bold"), ("pointer", "fg:#00afff bold"),
                             ("highlighted", "fg:#00afff bold"), ("selected", "fg:#00ff87 bold"),
                             ("answer", "fg:#00ff87 bold")])
+    paths, status = scan(overrides)        # discover + status once; reused across redraws
     while True:
         console.clear()
-        _render(console, overrides)
+        _render(console, paths, status)
         action = questionary.select("What do you want to do?", style=qs, qmark="»", choices=[
             questionary.Choice("Patch app(s)", "patch"),
             questionary.Choice("Restore app(s) from backup", "restore"),
@@ -415,10 +457,11 @@ def interactive(overrides):
         if action in (None, "quit"):
             console.print("[dim]bye 👋[/]"); return 0
         if action == "refresh":
+            paths, status = scan(overrides)        # explicit rescan on user request
             continue
         opts = []
         for t in TARGETS:
-            path, st = state(t, overrides)
+            path, st = paths[t], status[t]
             if not path:
                 continue
             if action == "patch" and st == "patched": continue        # nothing to do
@@ -435,6 +478,8 @@ def interactive(overrides):
             continue
         console.rule(f"[bold cyan]{action}[/]")
         run(action, sel, overrides)
+        for t in sel:                              # refresh only what we just touched
+            status[t] = _status_of(t, paths[t])
         console.rule(style="dim")
         questionary.press_any_key_to_continue("Enter to return to the menu…", style=qs).ask()
 
