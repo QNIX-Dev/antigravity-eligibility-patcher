@@ -193,7 +193,8 @@ CLI_GATE = Gate(rb"\x48\x85\xc0\x0f\x84....\x80\x78\x08\x00\x0f\x85....",
 def cli_default_paths():
     cands = []
     w = shutil.which("agy")
-    if w: cands.append(w)
+    if w:                                    # which() appends PATHEXT's upper-case .EXE; normalize for display + dedup
+        base, ext = os.path.splitext(w); cands.append(base + ext.lower())
     for root in _roots():
         cands += glob.glob(os.path.join(root, "agy", "bin", "agy.exe"))
         cands += glob.glob(os.path.join(root, "agy", "*", "bin", "agy.exe"))   # scoop version dirs
