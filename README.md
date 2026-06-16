@@ -1,4 +1,4 @@
-<h1 align="center">🚀 agy-unlock</h1>
+<h1 align="center">🚀 agy-manager</h1>
 <p align="center">
   <b>Легковесный и надежный патчер ограничений доступности Antigravity для Windows</b>
 </p>

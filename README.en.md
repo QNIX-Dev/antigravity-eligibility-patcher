@@ -1,4 +1,4 @@
-<h1 align="center">🚀 agy-unlock</h1>
+<h1 align="center">🚀 agy-manager</h1>
 <p align="center">
   <b>A lightweight, robust patcher designed to bypass cosmetic location restrictions in Antigravity apps on Windows</b>
 </p>
