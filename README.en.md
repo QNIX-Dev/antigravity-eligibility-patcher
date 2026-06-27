@@ -1,6 +1,6 @@
 <h1 align="center">🚀 agy-manager</h1>
 <p align="center">
-  <b>A lightweight, robust patcher designed to bypass cosmetic location restrictions in Antigravity apps on Windows</b>
+  <b>A lightweight, powerful environment manager for Antigravity developer tools on Windows (multi-account profile switching and location restriction bypass)</b>
 </p>
 
 <p align="center">
@@ -23,11 +23,13 @@
 
 ## ✨ Features
 
-- ⚡ **Zero-Dependency Core:** Patcher commands (`status`, `patch`, `restore`) run natively using Python's standard library.
-- 🎨 **Interactive Terminal UI:** Features a stylized console dashboard built with `rich` and `questionary`.
-- 🛡️ **Safe & Reversible:** Creates automatic backups (`*.agybak`) before modifying any file, allowing one-click rollback.
-- ⚙️ **Autodetect & Discover:** Searches registry keys, system PATH, environment paths, and Scoop directories to find installations dynamically. No hardcoded directories!
-- 🧬 **Version-Robust Patching:** Locates code signatures structures (using regex and relative instruction offsets) rather than static file offsets.
+- 👥 **Account Profile Manager:** Save, switch, and manage multiple authorization profiles (independently for CLI/Manager and IDE) without browser re-authentication or server-side token revocation.
+- 🔓 **Location Restriction Bypass:** Disable cosmetic location gates ("not available in your location") across all three applications (CLI, Manager, IDE).
+- 🎨 **Interactive TUI Dashboard:** Features a beautiful console dashboard built with `rich` and `questionary` for patches and accounts management.
+- ⚡ **Zero-Dependency Core:** Scriptable commands (`status`, `patch`, `restore`) run natively using Python's standard library.
+- 🛡️ **Safe & Reversible:** Automatically creates file backups (`*.agybak`) before any modification, allowing one-click rollback.
+- ⚙️ **Autodetect & Discover:** Searches registry keys, system PATH, environment variables, and Scoop directories to locate installations dynamically.
+- 🧬 **Version-Robust Patching:** Locates code signatures (using regex and relative instruction offsets) rather than relying on static file offsets.
 
 ---
 
@@ -79,6 +81,37 @@ Runs purely on the Python Standard Library (no `pip install` required).
 
 ---
 
+## 👥 Account Manager (Multi-Account Support)
+
+The tool allows saving and switching Antigravity authorization profiles without logging in again through the browser. Management is split into two independent areas:
+1. **CLI + Manager** (share a common token in Windows Credential Manager).
+2. **IDE** (uses its own authorization keys in the `state.vscdb` database).
+
+This allows you to switch profiles for different applications independently and avoid file locking conflicts. Profiles are safely stored in Windows Credential Manager.
+
+### Usage in the Interactive Menu:
+1. Run `python patch.py`
+2. Select **Manage accounts**
+3. Select the target area to manage: **CLI + Manager** or **IDE**
+4. You will have options to save, switch, remove profiles, or log out locally.
+
+### Usage via the Command Line:
+Commands follow the pattern: `python patch.py accounts <cli-manager|ide> <action> [name]`
+
+| Action | Example Command | Description |
+| :--- | :--- | :--- |
+| `list` (or `ls`) | `python patch.py accounts cli-manager list` | List saved profiles for the chosen area and mark the active one. |
+| `save <name>` | `python patch.py accounts cli-manager save work` | Save the current active session under the specified name. |
+| `use <name>` (or `switch`) | `python patch.py accounts cli-manager use personal` | Switch to a saved profile. |
+| `logout` | `python patch.py accounts cli-manager logout` | Sign out locally (to sign into another account). |
+| `rm <name>` | `python patch.py accounts cli-manager rm work` | Remove a saved profile. |
+| `current` (or `who`) | `python patch.py accounts cli-manager current` | Print the name of the current active profile. |
+
+> [!IMPORTANT]
+> Before switching profiles or signing out locally, make sure to close any running applications for the corresponding area (CLI/Manager or IDE) to avoid database and token file locking errors in memory.
+
+---
+
 ## 🔍 How it Works (Technical Details)
 
 <details>
@@ -112,6 +145,17 @@ The IDE is built on top of VS Code:
    `resetIsTierGCPTos\(\),this\.[A-Za-z_\$0-9]+\.isGoogleInternal`
 3. Replaces it with `resetIsTierGCPTos(),true` to force Google internal developer privileges.
 4. Wipes the system's VS Code compiled bytecode caches (`CachedData` and `Code Cache/js`) to ensure modifications apply instantly.
+</details>
+
+<details>
+<summary>👥 <b>Account Manager (Session and Profile Control)</b></summary>
+
+The account switching mechanism works entirely offline without invoking logout APIs, preventing server-side token revocation (the app's built-in logout button invalidates the refresh token on the server).
+
+1. **Storage Separation:** CLI and Manager tokens reside in Windows Credential Manager as `gemini:antigravity`. IDE tokens are stored in the VS Code SQLite global state database `state.vscdb` under `antigravityUnifiedStateSync.*` keys.
+2. **Secure Persistence:** When saving a profile (`save`), the script reads the active tokens, formats them, and saves them back into the Credential Manager under a secure name prefixed with `agy-manager:account:cli-manager:<name>` or `agy-manager:account:ide:<name>`.
+3. **Blob Size Limit Bypass:** Windows Credential Manager caps generic credential blobs at ~2560 bytes, but the IDE's JSON data (specifically `userStatus`) easily exceeds 8 KB. To circumvent this, the profile payload is automatically split into 2000-byte shards and stored as sequential entries (`.../<index>`).
+4. **Syncing and Lock Prevention:** Before switching profiles (`use`), the manager verifies that target applications are closed. If they are running, the switch is blocked to prevent the app from overwriting the restored keys from its in-memory cache. Before writing the new profile, the active session is automatically synced to preserve any rotated tokens.
 </details>
 
 ---
